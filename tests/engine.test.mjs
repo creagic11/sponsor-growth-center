@@ -1,0 +1,45 @@
+// Engine unit tests: recompute key figures from the raw data and compare with independently checked values (pandas).
+// Usage: node tests/engine.test.mjs
+import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const E = createRequire(import.meta.url)(path.join(ROOT, 'engine.js'));
+const load = (f) => JSON.parse(fs.readFileSync(path.join(ROOT, 'data', f), 'utf8'));
+let pass = 0, fail = 0;
+const eq = (name, got, want, tol = 0.01) => {
+  const ok = typeof want === 'number' ? Math.abs(got - want) <= tol : JSON.stringify(got) === JSON.stringify(want);
+  ok ? pass++ : fail++; console.log(ok ? 'PASS' : 'FAIL', name, ok ? '' : `got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
+};
+const cf = E.materialize(load('campusfest2025.json'), []);
+const s = E.snapshot(cf, '2025-04-20');
+const o = E.overview(s);
+eq('confirmed partnerships', o.confirmed.count, 24);
+eq('confirmed value ₹22.4L', o.confirmed.value_inr, 2240000);
+eq('cash deals 20 = ₹20L', [o.confirmed.cash_count, o.confirmed.cash_value_inr], [20, 2000000]);
+eq('cash collected is reported as unavailable', o.cash.available, false);
+eq('confirmed goal (revised plan)', o.targets.confirmed_partnerships_goal, 28);
+eq('qualified brands', o.qualification.qualified, 60);
+const k = E.campaignKpis(s);
+const verdict = Object.fromEntries(k.map((c) => [c.campaign_name, c.verdict && (c.verdict.call || c.verdict.state || c.verdict)]));
+eq('verdicts', verdict, {'Brand Discovery Email':'stop','Warm Partner Introductions':'scale','Brand Leader LinkedIn':'change','Partner Interest Form':'scale','Creator Network Referrals':'scale','Past Conversation Revival':'stop'});
+const bt = E.forecast(E.snapshot(cf, '2025-03-15'));
+eq('backtest at 15 Mar projects 28.1 deals (actual 24)', bt.projected_confirmed_count, 28.1, 0.05);
+eq('backtest at 15 Mar projects ₹24.4L (actual ₹22.4L)', bt.projected_confirmed_value_inr / 1e5, 24.4, 0.05);
+const cold = k.filter((c) => /Email|Revival/.test(c.campaign_name));
+eq('cold routes (email + revival) confirmed', cold.reduce((a, c) => a + (c.confirmed || 0), 0), 0);
+const m = E.snapshot(cf, '2025-03-01');
+eq('as-of 1 Mar confirmed', E.overview(m).confirmed.count, 10);
+eq('calculate', E.calculate('24/28*100').result, 85.714286, 0.001);
+const dl = E.materialize(load('delhi2027.json'), []);
+const ds = E.snapshot(dl, '2027-02-26');
+const base = E.scenario(ds, {});
+const val = (r) => r.plan_cash_inr;
+eq('scenario: title unsold → ₹17.0L', val(E.scenario(ds, { exclude_bets: ['TITLE'] })) / 1e5, 17.0, 0.05);
+eq('scenario: base plan ₹24L signed', E.scenario(ds, {}).plan_signed_inr, 2400000);
+eq('scenario: 70% collection → ₹16.8L', val(E.scenario(ds, { collection_rate: 0.7 })) / 1e5, 16.8, 0.05);
+const ps = E.planStatus(ds);
+eq('B2 gate stop (comfort quote over cap)', ps.bets.find((b) => b.bet_id === 'B2').gate.state, 'stop');
+console.log(`${pass}/${pass + fail} passed`);
+process.exit(fail ? 1 : 0);
