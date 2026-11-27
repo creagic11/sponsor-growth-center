@@ -4,7 +4,9 @@
 // so this function never sees or stores the dashboard data beyond the request it forwards.
 // GET  /api/chat -> { available, model }      POST /api/chat -> Gemini generateContent response
 
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// Accept "gemini-2.5-flash" or "models/gemini-2.5-flash"; anything else (blank, spaces, a pasted key) falls back to the default.
+function cleanModel(v) { const m = String(v || '').trim().replace(/^models\//, ''); return /^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(m) ? m : 'gemini-2.5-flash'; }
+const MODEL = cleanModel(process.env.GEMINI_MODEL);
 const WINDOW_MS = 10 * 60 * 1000; // per-visitor limit, best effort (memory is per server instance)
 const MAX_PER_WINDOW = 60;        // one question usually takes 2-5 calls (tool rounds)
 const MAX_BODY_CHARS = 1_000_000;
@@ -20,7 +22,7 @@ function limited(ip) {
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
-  const key = process.env.GEMINI_API_KEY;
+  const key = String(process.env.GEMINI_API_KEY || '').trim();
   if (req.method === 'GET') return res.status(200).json({ available: !!key, model: MODEL });
   if (req.method !== 'POST') { res.setHeader('Allow', 'GET, POST'); return res.status(405).json({ error: { message: 'Method not allowed' } }); }
   if (!key) return res.status(503).json({ error: { message: 'The built-in analyst is not configured on this deployment.' } });

@@ -23,7 +23,7 @@
 
   // ---------- provider config (standalone) ----------
   const cfgKey = 'gc_ai_cfg_v1';
-  const getCfg = () => { try { return JSON.parse(localStorage.getItem(cfgKey) || 'null') || {}; } catch (e) { return {}; } };
+  const getCfg = () => { try { const c = JSON.parse(localStorage.getItem(cfgKey) || 'null') || {}; if (c.model && !/^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(String(c.model).trim().replace(/^models\//, ''))) c.model = ''; else if (c.model) c.model = String(c.model).trim().replace(/^models\//, ''); return c; } catch (e) { return {}; } };
   const setCfg = (c) => { try { localStorage.setItem(cfgKey, JSON.stringify(c)); } catch (e) {} };
   const PROVIDERS = {
     gemini: { label: 'Google Gemini', model: 'gemini-2.5-flash', keyHelp: 'Free key from Google AI Studio (aistudio.google.com/apikey).' },
@@ -343,7 +343,9 @@ Settings: ${JSON.stringify(ws.settings)}`;
         <div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary">${builtIn ? 'Use my key' : 'Save and open the analyst'}</button>${c.key ? `<button type="button" class="btn danger" data-action="ai-remove">${builtIn ? 'Remove my key and use the built-in analyst' : 'Remove my key'}</button>` : ''}</div>
       </form>`;
   }
-  function saveCfg(fd) { const p = PROVIDERS[fd.provider] ? fd.provider : 'gemini'; setCfg({ provider: p, key: String(fd.key || '').trim(), model: String(fd.model || '').trim() }); histories[App.wsId] = histories[App.wsId] || []; shell(); }
+  // Model names: trim, drop a "models/" prefix, and ignore anything that is not a plain model id (blank uses the default).
+  const cleanModel = (v) => { const m = String(v || '').trim().replace(/^models\//, ''); return /^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(m) ? m : ''; };
+  function saveCfg(fd) { const p = PROVIDERS[fd.provider] ? fd.provider : 'gemini'; setCfg({ provider: p, key: String(fd.key || '').trim(), model: cleanModel(fd.model) }); histories[App.wsId] = histories[App.wsId] || []; shell(); }
   function removeCfg() { try { localStorage.removeItem(cfgKey); } catch (e) {} shell(); }
 
   async function ask(q, opts = {}) {
