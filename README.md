@@ -1,6 +1,6 @@
 # Sponsor Growth Center: Task 2, Challenge B (Sponsorship growth, Delhi festival)
 
-**Live demo:** deployed on Vercel from this repository (add the URL here after the first deploy).
+**Live demo:** https://sponsor-growth-center-three.vercel.app/ (deployed on Vercel from this repository).
 
 A static website: no sign-in, no server, no build step, and no AI needed. Your edits are saved in your browser, and **Data & settings → Reset** restores the original dataset exactly. The AI analyst is optional: it appears only after you add your own Google Gemini, Anthropic Claude or OpenAI API key.
 
@@ -317,7 +317,8 @@ The workflow test covers:
 
 ## 10. Tools used
 
-- An AI coding assistant (Claude Code) for research synthesis, code and tests.
+- Ideation, design direction and the end-to-end pipeline (research, strategy, data model, analytics, product and UX decisions, testing and deployment) were led, reviewed and approved by Anubhav.
+- Claude Code was used as the build assistant: research synthesis, writing the code and tests, under Anubhav's direction.
 - Vanilla JavaScript, HTML and CSS; inline SVG charts.
 - Python (pandas, openpyxl) for data conversion and simulation.
 - Playwright and Chromium for browser tests.
