@@ -37,4 +37,21 @@ globalThis.fetch = async (url, init) => {
 r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '7.7.7.7' } }), r);
 ok('retired model: switches to the newest flash model and succeeds', r.code === 200 && calls[2] && calls[2].includes('/models/gemini-3.8-flash:generateContent'), calls);
 r = res(); await h(req({ method: 'GET' }), r); ok('GET then reports the new model', r.body.model === 'gemini-3.8-flash', r.body);
+// overloaded model -> quick retry, then fall back to another model
+delete process.env.GEMINI_MODEL;
+delete require.cache[require.resolve('../api/chat.js')]; h = require('../api/chat.js');
+const c2 = [];
+globalThis.fetch = async (url, init) => {
+  c2.push({ url, body: init && init.body });
+  if (url.includes('/models?')) return { ok: true, status: 200, json: async () => ({ models: [{ name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] }, { name: 'models/gemini-3.8-flash-lite', supportedGenerationMethods: ['generateContent'] }] }) };
+  if (url.includes('gemini-3.8-flash:')) return { ok: false, status: 503, text: async () => JSON.stringify({ error: { message: 'This model is currently experiencing high demand.' } }) };
+  return { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }) };
+};
+r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '6.6.6.6' }, body: { contents: [{ role: 'model', parts: [{ functionCall: { name: 'x' }, thoughtSignature: 'abc' }] }] } }), r);
+const fb = c2.find((x) => x.url.includes('flash-lite:'));
+ok('busy model: retries, then falls back to another model', r.code === 200 && c2.filter((x) => x.url.includes('gemini-3.8-flash:')).length === 2 && !!fb, c2.map((x) => x.url));
+ok('fallback model gets the placeholder thought signature', fb && fb.body.includes('skip_thought_signature_validator') && !fb.body.includes('"abc"'), fb && fb.body);
+globalThis.fetch = async (url) => url.includes('/models?') ? { ok: true, status: 200, json: async () => ({ models: [] }) } : { ok: false, status: 503, text: async () => '{"error":{"message":"high demand"}}' };
+r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '5.5.5.5' } }), r);
+ok('all models busy → friendly 503', r.code === 503 && /very busy/.test(r.body.error.message), r.body);
 console.log(`${pass}/${pass + fail} passed`); process.exit(fail ? 1 : 0);

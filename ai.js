@@ -16,7 +16,8 @@
   let App; let root; const toolLimit = 32;
   const histories = {}; // per workspace: [{role, content}]
   const drafts = {};
-  let busy = false; let ctl = null;
+  let busy = false; let ctl = null; let failedQ = null;
+  const setState = (s) => { const st = root && root.querySelector('#live-state'); if (st) st.textContent = s; };
 
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const L = (x) => (x == null ? '–' : '₹' + (+(x / 100000).toFixed(2)) + 'L');
@@ -209,10 +210,13 @@ Settings: ${JSON.stringify(ws.settings)}`;
     const decl = tools.map((t) => { const d = { name: t.name, description: t.description }; const ps = geminiSchema(t.inputSchema); if (ps.properties) d.parameters = ps; return d; });
     let text = '';
     for (let round = 0; round < 8; round++) {
-      const res = await apiFetch(target.url, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, target.headers),
+      const send = () => apiFetch(target.url, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, target.headers),
         body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents, tools: [{ functionDeclarations: decl }] }) });
+      let res = await send();
+      // one quiet retry when the provider is momentarily overloaded
+      if (res.status === 503 || res.status === 500) { setState('The AI service is busy, trying again…'); await new Promise((r) => setTimeout(r, 2500)); res = await send(); }
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw { code: res.status === 429 ? 'rate_limited' : 'upstream_error', message: (j.error && j.error.message) || res.statusText };
+      if (!res.ok) throw { code: res.status === 429 && !/high demand/i.test((j.error && j.error.message) || '') ? 'rate_limited' : (res.status === 503 || /high demand|overloaded/i.test((j.error && j.error.message) || '')) ? 'busy' : 'upstream_error', message: (j.error && j.error.message) || res.statusText };
       const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
       const t = parts.filter((p) => p.text).map((p) => p.text).join('');
       if (t) { text += (text ? '\n\n' : '') + t; onText(text); }
@@ -308,7 +312,7 @@ Settings: ${JSON.stringify(ws.settings)}`;
     for (const m of h) {
       if (m.role === 'user' && m.hidden) continue;
       if (m.role === 'user') html += `<div class="msg user">${esc(m.display || m.content)}</div>`;
-      else html += `<div class="msg ai"><div class="body">${md(m.content)}</div>${m.truncated ? '<div class="small muted">The answer was cut short. Ask for less at a time.</div>' : ''}${(m.cards || []).map(cardHtml).join('')}${m.trace && m.trace.length ? traceHtml(m.trace) : ''}</div>`;
+      else html += `<div class="msg ai"><div class="body">${md(m.content)}</div>${m.truncated ? '<div class="small muted">The answer was cut short. Ask for less at a time.</div>' : ''}${m.retry && m === h[h.length - 1] ? `<div><button class="btn sm" data-ai="retry" data-q="${esc(m.retry)}">Try again</button></div>` : ''}${(m.cards || []).map(cardHtml).join('')}${m.trace && m.trace.length ? traceHtml(m.trace) : ''}</div>`;
     }
     if (busy) html += `<div class="msg ai" id="live"><div class="body" id="live-text"></div><div id="live-cards"></div><div class="thinking" id="live-state">Reading the data…</div><div id="live-trace"></div><button class="btn sm" data-ai="stop">Stop</button></div>`;
     log.innerHTML = html;
@@ -363,10 +367,16 @@ Settings: ${JSON.stringify(ws.settings)}`;
       finalText = r.text; truncated = r.truncated;
     } catch (e) {
       const code = e && e.code;
-      const msg = { cancelled: 'Stopped.', network: e.message, no_provider: 'Add an API key to use the analyst.', rate_limited: (e.message || 'Too many requests.') + ' (Rate limit.)' }[code] || ('The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.');
+      const own = ownKey();
+      const msg = { cancelled: 'Stopped.', network: e.message, no_provider: 'Add an API key to use the analyst.',
+        busy: 'The AI service is very busy right now, so I could not answer. This is temporary: press Try again in a minute. Everything else on the dashboard keeps working.',
+        rate_limited: own ? (e.message || 'Too many requests.') + ' (Your provider\'s rate limit.)' : 'Too many questions in a short time. Wait a minute and press Try again.' }[code]
+        || (own ? 'The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.' : 'The AI service returned an error: ' + ((e && e.message) || code || 'unknown') + '. Please press Try again.');
+      failedQ = (code === 'cancelled') ? null : q;
       finalText = (e && e.text ? e.text + '\n\n' : '') + '_' + msg + '_';
     }
-    h.push({ role: 'assistant', content: finalText || '(no answer)', truncated, cards: [...pendingCards], trace: trace.slice() });
+    h.push({ role: 'assistant', content: finalText || '(no answer)', truncated, cards: [...pendingCards], trace: trace.slice(), retry: failedQ || null });
+    failedQ = null;
     busy = false; pendingCards = [];
     renderLog();
   }
@@ -388,6 +398,7 @@ Settings: ${JSON.stringify(ws.settings)}`;
     const el = ev.target.closest('[data-ai]'); if (!el || !root.contains(el)) return;
     const a = el.dataset.ai;
     if (a === 'ask') ask(el.dataset.q);
+    else if (a === 'retry') { const h = hist(); if (h.length >= 2 && h[h.length - 1].retry) h.splice(h.length - 2, 2); ask(el.dataset.q); }
     else if (a === 'clear') { histories[App.wsId] = []; renderLog(); }
     else if (a === 'stop') { if (ctl) ctl.abort(); }
     else if (a === 'confirm') confirmDraft(el.dataset.id);

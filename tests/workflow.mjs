@@ -17,11 +17,12 @@ const results = [];
 const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };
 
 // ---- scripted stand-in for the OpenAI Chat Completions API ----
-let callN = 0; const keySeenBy = new Set(); const hostedCalls = { n: 0 }; const openaiCalls = { n: 0 };
+let callN = 0; const keySeenBy = new Set(); const hostedCalls = { n: 0 }; const busyLeft = { n: 2 }; const openaiCalls = { n: 0 };
 // Provider-neutral script: given the question and the tool results so far, either call a tool or answer.
 function decide(q, toolResults, all) {
   const call = (name, args) => ({ call: { name, args } });
   const say = (text) => ({ say: text });
+  if (q.includes('busy check')) return say('Recovered after the busy spell.');
   if (q.includes('cash have we')) return toolResults.length ? say('The data cannot answer this: ' + toolResults[0].what_the_data_cannot_answer[0]) : call('get_data_coverage', {});
   if (q.includes('create a task')) return toolResults.length ? say('Drafted a task. Please confirm the card.') : call('propose_task', { title: 'Close out idle cold-route deals', owner: 'Kabir Shah', due_date: '2025-04-23', priority: 'high', linked_type: 'campaign', linked_id: 'SC01', linked_label: 'Brand Discovery Email', notes: '0 of 11 email deals confirmed' });
   if (q.includes('did it save')) return toolResults.length ? say(`Tasks now: ${toolResults[0].counts.total}. ${all.includes('[Confirmed:') ? 'Confirmation seen.' : 'No confirmation in history.'}`) : call('list_tasks', {});
@@ -62,6 +63,7 @@ async function newCtx(hostedAvailable) {
     if (!hostedAvailable) return route.fulfill({ status: 404, contentType: 'text/plain', body: 'Not found' });
     if (req.method() === 'GET') return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ available: true, model: 'gemini-2.5-flash' }) });
     hostedCalls.n++;
+    if (String(req.postData()).toLowerCase().includes('busy check') && busyLeft.n > 0) { busyLeft.n--; return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.' } }) }); }
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(geminiReply(JSON.parse(req.postData()))) });
   });
   await ctx.route('https://api.openai.com/**', (route) => {
@@ -92,7 +94,7 @@ const ctx = await newCtx(true);
 const p = await ctx.newPage();
 const errs = [];
 p.on('pageerror', (e) => errs.push(e.message));
-p.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
+p.on('console', (m) => { if (m.type() === 'error' && !/status of 503/.test(m.text())) errs.push(m.text()); });
 await p.goto('http://gc.test/index.html#overview');
 await p.waitForSelector('.kpis', { timeout: 15000 }).catch(async () => { console.log('ERRS', errs); process.exit(1); });
 const kpiText = async () => p.locator('.kpis .kpi').first().innerText();
@@ -147,6 +149,15 @@ await p.waitForFunction(() => [...document.querySelectorAll('.msg.ai')].some((m)
 const a4 = await p.locator('.msg.ai').last().innerText();
 check('follow-up sees confirmation and the new task', a4.includes('Tasks now: 1') && a4.includes('Confirmation seen'), a4);
 await p.screenshot({ path: `${out}/wf-chat.png` });
+// provider overloaded: one quiet retry, then a friendly message with Try again, which then succeeds
+await p.fill('#chat-text', 'busy check');
+await p.press('#chat-text', 'Enter');
+await p.waitForSelector('[data-ai="retry"]', { timeout: 15000 }).catch(() => {});
+const busyMsg = await p.locator('.msg.ai').last().innerText();
+check('busy provider: friendly message and Try again button', /very busy/.test(busyMsg) && !/Check the key/.test(busyMsg) && await p.locator('[data-ai="retry"]').count() === 1, busyMsg);
+await p.click('[data-ai="retry"]');
+await p.waitForFunction(() => [...document.querySelectorAll('.msg.ai')].some((m) => m.innerText.includes('Recovered')));
+check('Try again recovers and replaces the failed answer', (await p.locator('[data-ai="retry"]').count()) === 0 && (await p.locator('.msg.user', { hasText: 'busy check' }).count()) === 1);
 check('questions went through the built-in analyst', hostedCalls.n >= 8 && openaiCalls.n === 0, hostedCalls);
 
 // 4a) bring your own key (OpenAI, stubbed) overrides the built-in analyst
