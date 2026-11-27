@@ -10,10 +10,10 @@ const out = process.argv[2] || path.join(ROOT, 'shots'); fs.mkdirSync(out, { rec
 const b = await chromium.launch();
 const p = await b.newPage({ viewport: { width: 1440, height: 1000 } });
 // Serve the app folder from disk through request interception (no local server needed)
-await p.route('http://gc.test/**', (route) => { const u = new URL(route.request().url()); route.fulfill({ path: path.join(ROOT, decodeURIComponent(u.pathname)) }); });
+await p.route('http://gc.test/**', (route) => { const f = path.join(ROOT, decodeURIComponent(new URL(route.request().url()).pathname)); if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) return route.fulfill({ status: 404, body: 'Not found' }); route.fulfill({ path: f }); });
 await p.route('https://fonts.googleapis.com/**', (r) => r.fulfill({ body: '', contentType: 'text/css' }));
 const errs = [];
-p.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
+p.on('console', (m) => { if (m.type() === 'error' && !/404/.test(m.text())) errs.push(m.text()); }); // a 404 is expected for api/chat on a host without the built-in analyst
 p.on('pageerror', (e) => errs.push('PAGEERROR ' + e.message));
 await p.goto('http://gc.test/index.html#overview');
 await p.waitForSelector('.kpis');

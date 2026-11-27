@@ -3,8 +3,12 @@
  * that runs the same engine functions as the dashboard, against the data as it is right now
  * (including the team's edits). Writes are only ever proposed; a person confirms each one on a card.
  *
- * Optional: the analyst appears only after a visitor adds their own API key for Google Gemini, Anthropic Claude
- * or OpenAI. The key stays in this browser (localStorage) and is sent only to that provider's API.
+ * Two ways to run it:
+ *  1. Built-in: when the deployment has a server-side Gemini key (api/chat.js), the analyst works for every
+ *     visitor with no setup. The key never reaches the browser.
+ *  2. Bring your own key: a visitor can instead add their own Google Gemini, Anthropic Claude or OpenAI key.
+ *     It stays in this browser (localStorage) and is sent only to that provider's API.
+ * With neither, the analyst stays hidden and the rest of the site works the same.
  */
 (function () {
   'use strict';
@@ -26,7 +30,14 @@
     anthropic: { label: 'Anthropic Claude', model: 'claude-sonnet-5-5', keyHelp: 'Key from console.anthropic.com.' },
     openai: { label: 'OpenAI', model: 'gpt-4.1-mini', keyHelp: 'Key from platform.openai.com/api-keys.' },
   };
-  function providerName() { const c = getCfg(); if (c.provider && c.key && PROVIDERS[c.provider]) return `${PROVIDERS[c.provider].label} · ${c.model || PROVIDERS[c.provider].model}`; return null; }
+  let hosted = null; // { available, model } from GET /api/chat
+  const ownKey = () => { const c = getCfg(); return !!(c.provider && c.key && PROVIDERS[c.provider]); };
+  function providerName() {
+    const c = getCfg();
+    if (ownKey()) return `${PROVIDERS[c.provider].label} · ${c.model || PROVIDERS[c.provider].model} (your key)`;
+    if (hosted && hosted.available) return `Built-in · Gemini ${hosted.model || ''}`.trim();
+    return null;
+  }
   const enabled = () => !!providerName();
 
   // ---------- rules ----------
@@ -143,8 +154,12 @@ Settings: ${JSON.stringify(ws.settings)}`;
     const tools = TOOLS.slice(0, toolLimit).map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, execute: async (input) => runTool(t, input) }));
     const c = getCfg();
     ctl = new AbortController();
+    if (!ownKey()) {
+      if (hosted && hosted.available) return geminiLoop(messages, tools, { url: 'api/chat', headers: {} }, onText);
+      throw { code: 'no_provider' };
+    }
     if (c.provider === 'anthropic') return anthropicLoop(messages, tools, c, onText);
-    if (c.provider === 'gemini') return geminiLoop(messages, tools, c, onText);
+    if (c.provider === 'gemini') return geminiLoop(messages, tools, { url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(c.model || PROVIDERS.gemini.model)}:generateContent`, headers: { 'x-goog-api-key': c.key } }, onText);
     if (c.provider === 'openai') return openaiLoop(messages, tools, c, onText);
     throw { code: 'no_provider', message: 'No AI provider is connected.' };
   }
@@ -188,16 +203,16 @@ Settings: ${JSON.stringify(ws.settings)}`;
     if (out.type === 'object' && out.properties && !Object.keys(out.properties).length) delete out.properties;
     return out;
   }
-  async function geminiLoop(messages, tools, c, onText) {
+  async function geminiLoop(messages, tools, target, onText) {
     const sys = messages[0].content;
     const contents = messages.slice(1).map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
     const decl = tools.map((t) => { const d = { name: t.name, description: t.description }; const ps = geminiSchema(t.inputSchema); if (ps.properties) d.parameters = ps; return d; });
     let text = '';
     for (let round = 0; round < 8; round++) {
-      const res = await apiFetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(c.model || 'gemini-2.5-flash')}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key },
+      const res = await apiFetch(target.url, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, target.headers),
         body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents, tools: [{ functionDeclarations: decl }] }) });
-      const j = await res.json();
-      if (!res.ok) throw { code: 'upstream_error', message: (j.error && j.error.message) || res.statusText };
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw { code: res.status === 429 ? 'rate_limited' : 'upstream_error', message: (j.error && j.error.message) || res.statusText };
       const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
       const t = parts.filter((p) => p.text).map((p) => p.text).join('');
       if (t) { text += (text ? '\n\n' : '') + t; onText(text); }
@@ -316,15 +331,16 @@ Settings: ${JSON.stringify(ws.settings)}`;
   // Setup form, shown in a drawer by the app. Optional: the dashboard works fully without it.
   function setupHtml() {
     const c = getCfg(); const cur = PROVIDERS[c.provider] ? c.provider : 'gemini';
-    return `<h2>Add an AI analyst (optional)</h2>
-      <p class="muted">The dashboard works without this. With your own API key, an analyst panel appears that answers questions from this data, runs the calculations, says when the data cannot answer, and drafts tasks for you to confirm.</p>
+    const builtIn = hosted && hosted.available;
+    return `<h2>${builtIn ? 'AI analyst settings' : 'Add an AI analyst (optional)'}</h2>
+      <p class="muted">${builtIn ? `The built-in analyst (Google Gemini) is ready with no setup.${ownKey() ? ' You are currently using your own key instead.' : ''} You can use your own key instead, for example for higher limits or a different model.` : 'The dashboard works without this. With your own API key, an analyst panel appears that answers questions from this data, runs the calculations, says when the data cannot answer, and drafts tasks for you to confirm.'}</p>
       <form class="form" data-submit="ai-cfg">
         <label class="wide">Provider<select name="provider">${Object.entries(PROVIDERS).map(([k, p]) => `<option value="${k}" ${k === cur ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}</select></label>
         <label class="wide">Model<input name="model" value="${esc(c.model || '')}" placeholder="Leave blank for the default: ${esc(PROVIDERS[cur].model)}"></label>
         <label class="wide">API key<input name="key" type="password" autocomplete="off" required value="${esc(c.key || '')}"></label>
         <p class="small muted wide">${Object.values(PROVIDERS).map((p) => `<b>${esc(p.label)}:</b> ${esc(p.keyHelp)}`).join('<br>')}</p>
         <p class="small muted wide">Your key is stored only in this browser and sent only to the provider you pick. Usage is billed to your account with that provider. Remove it here at any time.</p>
-        <div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary">Save and open the analyst</button>${c.key ? '<button type="button" class="btn danger" data-action="ai-remove">Remove my key</button>' : ''}</div>
+        <div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary">${builtIn ? 'Use my key' : 'Save and open the analyst'}</button>${c.key ? `<button type="button" class="btn danger" data-action="ai-remove">${builtIn ? 'Remove my key and use the built-in analyst' : 'Remove my key'}</button>` : ''}</div>
       </form>`;
   }
   function saveCfg(fd) { const p = PROVIDERS[fd.provider] ? fd.provider : 'gemini'; setCfg({ provider: p, key: String(fd.key || '').trim(), model: String(fd.model || '').trim() }); histories[App.wsId] = histories[App.wsId] || []; shell(); }
@@ -345,7 +361,7 @@ Settings: ${JSON.stringify(ws.settings)}`;
       finalText = r.text; truncated = r.truncated;
     } catch (e) {
       const code = e && e.code;
-      const msg = { cancelled: 'Stopped.', network: e.message, no_provider: 'Add an API key to use the analyst.' }[code] || ('The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.');
+      const msg = { cancelled: 'Stopped.', network: e.message, no_provider: 'Add an API key to use the analyst.', rate_limited: (e.message || 'Too many requests.') + ' (Rate limit.)' }[code] || ('The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.');
       finalText = (e && e.text ? e.text + '\n\n' : '') + '_' + msg + '_';
     }
     h.push({ role: 'assistant', content: finalText || '(no answer)', truncated, cards: [...pendingCards], trace: trace.slice() });
@@ -376,8 +392,19 @@ Settings: ${JSON.stringify(ws.settings)}`;
     else if (a === 'discard') { const d = drafts[el.dataset.id]; if (d) { d.status = 'discarded'; hist().push({ role: 'user', hidden: true, content: `[Discarded draft: ${d.title}]` }); renderLog(); } }
   }
 
+  // Ask the deployment whether a built-in analyst is configured (api/chat.js with a server-side key).
+  async function detectHosted() {
+    try {
+      const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), 6000);
+      const r = await fetch('api/chat', { method: 'GET', signal: ac.signal, headers: { accept: 'application/json' } }); clearTimeout(tm);
+      if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) return null;
+      const j = await r.json(); return j && j.available ? { available: true, model: j.model || '' } : null;
+    } catch (e) { return null; }
+  }
+
   async function mount(el, app) {
     App = app; root = el;
+    detectHosted().then((h) => { hosted = h; if (h) { shell(); App.onAiChange && App.onAiChange(); } });
     shell();
     root.addEventListener('click', onClick);
     root.addEventListener('input', (ev) => { const t = ev.target; if (t.dataset && t.dataset.df) { const d = drafts[t.dataset.id]; if (d) d.payload[t.dataset.df] = t.value; } if (t.id === 'chat-text') { t.style.height = 'auto'; t.style.height = Math.min(140, t.scrollHeight) + 'px'; } });

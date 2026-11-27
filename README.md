@@ -2,7 +2,7 @@
 
 **Live demo:** https://sponsor-growth-center-three.vercel.app/ (deployed on Vercel from this repository).
 
-A static website: no sign-in, no server, no build step, and no AI needed. Your edits are saved in your browser, and **Data & settings → Reset** restores the original dataset exactly. The AI analyst is optional: it appears only after you add your own Google Gemini, Anthropic Claude or OpenAI API key.
+A static website with one small serverless function: no sign-in and no build step. Your edits are saved in your browser, and **Data & settings → Reset** restores the original dataset exactly. The AI analyst works for every visitor with no setup (a built-in Google Gemini key held on the server). Visitors can use their own Google Gemini, Anthropic Claude or OpenAI key instead.
 
 The Growth Center is the operating tool behind the Task 1 plan: commit to **₹20.4L pre-festival cash (₹24L signed × 85% collected)**, with a gated stretch to ₹27L. It does four things the assignment asks for, and a fifth for the bonus:
 
@@ -12,7 +12,7 @@ The Growth Center is the operating tool behind the Task 1 plan: commit to **₹2
 | **Diagnose**: what works, bottlenecks, drivers | Funnel "largest drop", Needs attention list, per-campaign verdict with its reason, idle-deal detection, bet gates |
 | **Support decisions**: scale / change / stop | Rule-based verdict on every campaign and bet, each showing its rule; scenario reforecast on Bets & cash |
 | **Manage execution**: campaigns, tasks, owners, deadlines | Edit deal stages, log interactions, create and edit campaigns, budgets, owners, targets, tasks and payments. Every edit persists and the analytics recompute at once |
-| **AI Growth Analyst** (brownie points, optional) | **Add AI analyst** (top right) with your own key, then a right-hand panel (a bottom sheet on phones). It answers from live app data through 16 tools, labels each number FACT / CALC / ASSUMPTION, says when the data cannot answer, and drafts tasks or changes that are saved only when you press **Confirm** |
+| **AI Growth Analyst** (brownie points) | Right-hand panel (a bottom sheet on phones), ready with no setup. It answers from live app data through 16 tools, labels each number FACT / CALC / ASSUMPTION, says when the data cannot answer, and drafts tasks or changes that are saved only when you press **Confirm** |
 
 ---
 
@@ -231,7 +231,9 @@ The model then calls tools that run the same engine functions the screens use:
 - Nothing is written before Confirm. Confirmed items are saved with `source: "ai"`.
 - A hidden `[Confirmed: …]` note goes into the history, so follow-ups ("did it save?", "now assign it to Ishita") know what happened.
 
-**Providers (bring your own key).** Click **Add AI analyst**, pick a provider, paste a key and optionally a model:
+**Built-in analyst (no setup).** `api/chat.js` is a Vercel serverless function that forwards the analyst's requests to Google Gemini (`gemini-2.5-flash` by default) with the site owner's key, stored as the `GEMINI_API_KEY` environment variable. The key never reaches the browser. The function only forwards the conversation and tool declarations; the tools themselves run in the visitor's browser on the live data. It accepts calls only from the site's own pages, has a per-visitor rate limit (60 model calls per 10 minutes, about 15 questions), and fixes the model on the server.
+
+**Bring your own key (optional).** Click **Key** in the analyst panel (or **Add AI analyst** on a host without the built-in key), pick a provider, paste a key and optionally a model:
 
 | Provider | Default model | API called from the browser |
 |---|---|---|
@@ -239,7 +241,7 @@ The model then calls tools that run the same engine functions the screens use:
 | Anthropic Claude | `claude-sonnet-5-5` | `api.anthropic.com/v1/messages` (tool use) |
 | OpenAI | `gpt-4.1-mini` | `api.openai.com/v1/chat/completions` (tool calls) |
 
-The key is stored only in that browser's `localStorage` and sent only to the chosen provider (the workflow test checks this). **Key** in the analyst panel changes or removes it. Without a key, the panel and every "ask" button stay hidden and the rest of the site works the same.
+Your own key is stored only in that browser's `localStorage`, sent only to the chosen provider (the workflow test checks this), and used instead of the built-in analyst until you remove it. If neither is available (for example on a static host without the function), the panel and every "ask" button stay hidden and the rest of the site works the same.
 
 **Try these** (they are also suggestion chips):
 
@@ -273,9 +275,10 @@ The key is stored only in that browser's `localStorage` and sent only to the cho
 **Deploy on Vercel (no build step).**
 1. In Vercel, choose **Add New → Project** and import this GitHub repository.
 2. Framework preset: **Other**. Leave the build command and output directory empty (the site is the repository root).
-3. Deploy. Every push to `main` redeploys.
+3. **Built-in analyst:** create a free Gemini API key at Google AI Studio (aistudio.google.com/apikey). In Vercel, open the project's **Settings → Environment Variables**, add `GEMINI_API_KEY` with that key (all environments), and redeploy. Optional: `GEMINI_MODEL` to change the model.
+4. Deploy. Every push to `main` redeploys.
 
-Any static host works the same way (Netlify, GitHub Pages, Cloudflare Pages).
+Other static hosts (Netlify, GitHub Pages, Cloudflare Pages) serve the dashboard the same way; without the function, visitors add their own key for the analyst.
 
 **Run locally.** Serve the folder over HTTP (not `file://`, because the page fetches `data/*.json`):
 
@@ -283,7 +286,7 @@ Any static host works the same way (Netlify, GitHub Pages, Cloudflare Pages).
 python3 -m http.server 8000      # then open http://localhost:8000/
 ```
 
-**Optional AI analyst:** click **Add AI analyst** and paste a Gemini, Claude or OpenAI key.
+**AI analyst locally:** a plain HTTP server has no `api/chat`, so click **Add AI analyst** and paste a Gemini, Claude or OpenAI key (or run `vercel dev` with `GEMINI_API_KEY` set).
 
 **Regenerating the data:** the original workbook is kept at `data/source/Sponsor Dataset.xlsx`. Run `python3 scripts/convert_dataset.py "data/source/Sponsor Dataset.xlsx"` and `python3 scripts/simulate_delhi2027.py` (requires pandas and openpyxl).
 
@@ -292,13 +295,14 @@ python3 -m http.server 8000      # then open http://localhost:8000/
 | Command | What it checks |
 |---|---|
 | `node tests/engine.test.mjs` | 16 checks: KPIs, verdicts, as-of, backtest, scenarios, gates |
-| `node tests/workflow.mjs` | 26 end-to-end checks in Chromium, with a scripted stand-in for the OpenAI API that calls the app's real tools (see below) |
+| `node tests/workflow.mjs` | 29 end-to-end checks in Chromium, with scripted stand-ins for the built-in analyst (Gemini format) and the OpenAI API that call the app's real tools (see below) |
+| `node tests/api.test.mjs` | 9 checks on `api/chat.js`: key never exposed, fixed model, only allowed fields forwarded, other origins refused, rate limit |
 | `node tests/smoke.mjs` | Every view in both workspaces with no console errors |
 
 The workflow test covers:
 
-- the site working with no AI (panel hidden, "Add AI analyst" offered) and no hosting-platform branding;
-- the analyst appearing after a key is added;
+- the site working with no AI on a host without the function (panel hidden, "Add AI analyst" offered) and no hosting-platform branding;
+- the built-in analyst being ready with no key, and a visitor's own key (OpenAI) taking over when added;
 - grounded answers with a calculation;
 - a deal edit recomputing the KPIs, and the analyst seeing the change;
 - "data cannot answer";
@@ -322,7 +326,7 @@ The workflow test covers:
 - Vanilla JavaScript, HTML and CSS; inline SVG charts.
 - Python (pandas, openpyxl) for data conversion and simulation.
 - Playwright and Chromium for browser tests.
-- Vercel for static hosting; the browser's `localStorage` for persistence; the visitor's own Gemini, Claude or OpenAI key for the optional analyst.
+- Vercel for hosting and the serverless function; the browser's `localStorage` for persistence; Google Gemini (free tier) for the built-in analyst, or the visitor's own Gemini, Claude or OpenAI key.
 
 ---
 
@@ -332,7 +336,8 @@ The workflow test covers:
 - **No real cash data for 2025.** "Confirmed" values are not bank-verified, so collection rates are assumptions.
 - **Small samples.** 21–33 closed deals; the per-campaign rates are shrunk but still noisy. The backtest overshoots by about 4 deals.
 - **Model behaviour is not unit-tested.** The tests prove the plumbing (tools, confirmation, persistence) with a scripted stand-in model. Live answers depend on the provider and model chosen, and smaller models follow the rules less reliably.
-- **API keys live in the visitor's browser** and calls go straight from the browser to the provider. That is fine for a demo, not for production, where a small server would hold the key. A provider can also refuse browser calls (CORS) or rate-limit a free key; the panel then shows the provider's error.
+- **The built-in analyst shares one free Gemini quota.** Google's free tier has daily and per-minute limits, so heavy use by many visitors can hit them; the panel then shows the limit message and suggests adding your own key. The per-visitor limit is held in memory, so it is best effort across server instances.
+- **A visitor's own key lives in their browser** and calls go straight from the browser to the provider. That is fine for a demo, not for production. A provider can also refuse browser calls (CORS); the panel then shows the provider's error.
 - **Edits are per browser.** There is no shared team database or sign-in, so two people see their own copies. Export the change log to share it.
 - **Tool-call rounds are capped** at 8 per question. Very broad questions can end with a partial answer, which the panel flags.
 - **The as-of date is a day, not a time.** Edits made in the app take effect at 20:00 IST on the chosen date.

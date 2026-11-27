@@ -1,6 +1,6 @@
 // End-to-end workflow test in a real browser (Playwright + Chromium). No server and no real AI key needed:
-// the site is served from disk by request interception, and the OpenAI API is replaced by a scripted stand-in
-// that calls the app's real tools in the real Chat Completions format.
+// the site is served from disk by request interception, and both the built-in analyst (api/chat, Gemini format)
+// and the OpenAI API are replaced by scripted stand-ins that call the app's real tools in each provider's format.
 // It proves the plumbing, not a model's judgement: the analyst is hidden until a key is added, tools run against
 // live app data, edits persist in the browser and recompute analytics, drafts are saved only after Confirm,
 // follow-ups see the confirmation, undo and reset work, and the key is sent nowhere but the chosen provider.
@@ -17,37 +17,78 @@ const results = [];
 const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };
 
 // ---- scripted stand-in for the OpenAI Chat Completions API ----
-let callN = 0; const keySeenBy = new Set();
-function scripted(body) {
-  const msgs = body.messages;
-  let ui = msgs.length - 1; while (ui >= 0 && !(msgs[ui].role === 'user' && !String(msgs[ui].content).startsWith('['))) ui--;
-  const q = String(msgs[ui].content).toLowerCase();
-  const toolMsgs = msgs.slice(ui + 1).filter((m) => m.role === 'tool').map((m) => JSON.parse(m.content));
-  const call = (name, args) => ({ role: 'assistant', content: null, tool_calls: [{ id: 'call_' + (++callN), type: 'function', function: { name, arguments: JSON.stringify(args) } }] });
-  const say = (s) => ({ role: 'assistant', content: s });
-  const all = msgs.map((m) => String(m.content || '')).join('\n');
-  if (q.includes('cash have we')) return toolMsgs.length ? say('The data cannot answer this: ' + toolMsgs[0].what_the_data_cannot_answer[0]) : call('get_data_coverage', {});
-  if (q.includes('create a task')) return toolMsgs.length ? say('Drafted a task. Please confirm the card.') : call('propose_task', { title: 'Close out idle cold-route deals', owner: 'Kabir Shah', due_date: '2025-04-23', priority: 'high', linked_type: 'campaign', linked_id: 'SC01', linked_label: 'Brand Discovery Email', notes: '0 of 11 email deals confirmed' });
-  if (q.includes('did it save')) return toolMsgs.length ? say(`Tasks now: ${toolMsgs[0].counts.total}. ${all.includes('[Confirmed:') ? 'Confirmation seen.' : 'No confirmation in history.'}`) : call('list_tasks', {});
+let callN = 0; const keySeenBy = new Set(); const hostedCalls = { n: 0 }; const openaiCalls = { n: 0 };
+// Provider-neutral script: given the question and the tool results so far, either call a tool or answer.
+function decide(q, toolResults, all) {
+  const call = (name, args) => ({ call: { name, args } });
+  const say = (text) => ({ say: text });
+  if (q.includes('cash have we')) return toolResults.length ? say('The data cannot answer this: ' + toolResults[0].what_the_data_cannot_answer[0]) : call('get_data_coverage', {});
+  if (q.includes('create a task')) return toolResults.length ? say('Drafted a task. Please confirm the card.') : call('propose_task', { title: 'Close out idle cold-route deals', owner: 'Kabir Shah', due_date: '2025-04-23', priority: 'high', linked_type: 'campaign', linked_id: 'SC01', linked_label: 'Brand Discovery Email', notes: '0 of 11 email deals confirmed' });
+  if (q.includes('did it save')) return toolResults.length ? say(`Tasks now: ${toolResults[0].counts.total}. ${all.includes('[Confirmed:') ? 'Confirmation seen.' : 'No confirmation in history.'}`) : call('list_tasks', {});
   if (q.includes('confirmed')) {
-    if (toolMsgs.length === 0) return call('get_overview', {});
-    if (toolMsgs.length === 1) { const o = toolMsgs[0]; return call('calculate', { expression: `${o.confirmed.count}/${o.targets.confirmed_partnerships_goal}*100` }); }
-    const o = toolMsgs[0]; return say(`**${o.confirmed.count}** confirmed of ${o.targets.confirmed_partnerships_goal} (${toolMsgs[1].result}%).`);
+    if (toolResults.length === 0) return call('get_overview', {});
+    if (toolResults.length === 1) { const o = toolResults[0]; return call('calculate', { expression: `${o.confirmed.count}/${o.targets.confirmed_partnerships_goal}*100` }); }
+    const o = toolResults[0]; return say(`**${o.confirmed.count}** confirmed of ${o.targets.confirmed_partnerships_goal} (${toolResults[1].result}%).`);
   }
   return say('ok');
 }
+// OpenAI Chat Completions format (bring-your-own-key path)
+function openaiReply(body) {
+  const msgs = body.messages;
+  let ui = msgs.length - 1; while (ui >= 0 && !(msgs[ui].role === 'user' && !String(msgs[ui].content).startsWith('['))) ui--;
+  const d = decide(String(msgs[ui].content).toLowerCase(), msgs.slice(ui + 1).filter((m) => m.role === 'tool').map((m) => JSON.parse(m.content)), msgs.map((m) => String(m.content || '')).join('\n'));
+  const message = d.call ? { role: 'assistant', content: null, tool_calls: [{ id: 'call_' + (++callN), type: 'function', function: { name: d.call.name, arguments: JSON.stringify(d.call.args) } }] } : { role: 'assistant', content: d.say };
+  return { choices: [{ index: 0, message, finish_reason: d.call ? 'tool_calls' : 'stop' }] };
+}
+// Gemini generateContent format (built-in analyst via api/chat)
+function geminiReply(body) {
+  const cs = body.contents; const isText = (c) => c.role === 'user' && c.parts.some((x) => typeof x.text === 'string' && !x.text.startsWith('['));
+  let ui = cs.length - 1; while (ui >= 0 && !isText(cs[ui])) ui--;
+  const q = cs[ui].parts.map((x) => x.text || '').join(' ').toLowerCase();
+  const results = cs.slice(ui + 1).flatMap((c) => c.parts.filter((x) => x.functionResponse).map((x) => x.functionResponse.response.result));
+  const all = cs.map((c) => c.parts.map((x) => x.text || '').join(' ')).join('\n');
+  const d = decide(q, results, all);
+  return { candidates: [{ content: { role: 'model', parts: [d.call ? { functionCall: { name: d.call.name, args: d.call.args } } : { text: d.say }] } }] };
+}
 
 const b = await chromium.launch();
-const ctx = await b.newContext({ viewport: { width: 1440, height: 1000 } });
-await ctx.route('http://gc.test/**', (route) => { const u = new URL(route.request().url()); route.fulfill({ path: path.join(ROOT, decodeURIComponent(u.pathname)) }); });
-await ctx.route('https://fonts.googleapis.com/**', (r) => r.fulfill({ body: '', contentType: 'text/css' }));
-await ctx.route('https://api.openai.com/**', (route) => {
-  const req = route.request();
-  if (req.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'POST' } });
-  const message = scripted(JSON.parse(req.postData()));
-  route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ choices: [{ index: 0, message, finish_reason: message.tool_calls ? 'tool_calls' : 'stop' }] }) });
-});
-ctx.on('request', (r) => { const h = r.headers(); if (JSON.stringify(h).includes('test-key-123')) keySeenBy.add(new URL(r.url()).host); });
+async function newCtx(hostedAvailable) {
+  const ctx = await b.newContext({ viewport: { width: 1440, height: 1000 } });
+  await ctx.route('http://gc.test/**', (route) => { const u = new URL(route.request().url()); route.fulfill({ path: path.join(ROOT, decodeURIComponent(u.pathname)) }); });
+  await ctx.route('https://fonts.googleapis.com/**', (r) => r.fulfill({ body: '', contentType: 'text/css' }));
+  // stand-in for the deployed api/chat.js (a static host without it returns 404, which the app treats as "no built-in analyst")
+  await ctx.route('http://gc.test/api/chat', (route) => {
+    const req = route.request();
+    if (!hostedAvailable) return route.fulfill({ status: 404, contentType: 'text/plain', body: 'Not found' });
+    if (req.method() === 'GET') return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ available: true, model: 'gemini-2.5-flash' }) });
+    hostedCalls.n++;
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(geminiReply(JSON.parse(req.postData()))) });
+  });
+  await ctx.route('https://api.openai.com/**', (route) => {
+    const req = route.request();
+    if (req.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'POST' } });
+    openaiCalls.n++;
+    route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify(openaiReply(JSON.parse(req.postData()))) });
+  });
+  ctx.on('request', (r) => { if (JSON.stringify(r.headers()).includes('test-key-123')) keySeenBy.add(new URL(r.url()).host); });
+  return ctx;
+}
+
+// A) a host without the built-in analyst: everything works, the analyst stays hidden until a key is added
+{
+  const ctx = await newCtx(false); const q = await ctx.newPage(); const qe = [];
+  q.on('pageerror', (e) => qe.push(e.message));
+  await q.goto('http://gc.test/index.html#overview'); await q.waitForSelector('.kpis'); await q.waitForTimeout(800);
+  check('without a built-in key: analyst hidden, "Add AI analyst" offered', !(await q.locator('#chat').isVisible()) && (await q.locator('[data-action="ai-setup"]').first().isVisible()));
+  const html = await q.content();
+  check('no Claude or claude.ai branding in the page', !/claude\.ai|window\.claude|artifact/i.test(html), (html.match(/claude\.ai|artifact/i) || [])[0]);
+  await q.screenshot({ path: `${out}/web-no-ai.png` });
+  check('no page errors without the built-in analyst', qe.length === 0, qe);
+  await ctx.close();
+}
+
+// B) the Vercel deployment with the built-in analyst
+const ctx = await newCtx(true);
 const p = await ctx.newPage();
 const errs = [];
 p.on('pageerror', (e) => errs.push(e.message));
@@ -57,18 +98,8 @@ await p.waitForSelector('.kpis', { timeout: 15000 }).catch(async () => { console
 const kpiText = async () => p.locator('.kpis .kpi').first().innerText();
 const before = await kpiText();
 check('baseline confirmed 24/28 from the original dataset', before.includes('24') && before.includes('28'), before);
-check('works with no AI: analyst panel hidden, "Add AI analyst" offered', !(await p.locator('#chat').isVisible()) && (await p.locator('[data-action="ai-setup"]').first().isVisible()));
-const html = await p.content();
-check('no Claude or claude.ai branding in the page', !/claude\.ai|window\.claude|artifact/i.test(html), (html.match(/claude\.ai|artifact/i) || [])[0]);
-await p.screenshot({ path: `${out}/web-no-ai.png` });
-
-// add a key (OpenAI, stubbed) -> analyst appears
-await p.locator('[data-action="ai-setup"]').first().click();
-await p.selectOption('form[data-submit="ai-cfg"] select[name="provider"]', 'openai');
-await p.fill('form[data-submit="ai-cfg"] input[name="key"]', 'test-key-123');
-await p.click('form[data-submit="ai-cfg"] button.primary');
-await p.waitForSelector('#chat-text');
-check('analyst appears after adding a key', await p.locator('#chat').isVisible());
+await p.waitForSelector('#chat-text', { timeout: 8000 }).catch(() => {});
+check('built-in analyst ready with no key', await p.locator('#chat').isVisible() && /Built-in/.test(await p.locator('#ai-status').innerText()));
 
 // 1) analyst grounded answer with calculation
 await p.fill('#chat-text', 'How many partnerships are confirmed?');
@@ -116,6 +147,18 @@ await p.waitForFunction(() => [...document.querySelectorAll('.msg.ai')].some((m)
 const a4 = await p.locator('.msg.ai').last().innerText();
 check('follow-up sees confirmation and the new task', a4.includes('Tasks now: 1') && a4.includes('Confirmation seen'), a4);
 await p.screenshot({ path: `${out}/wf-chat.png` });
+check('questions went through the built-in analyst', hostedCalls.n >= 8 && openaiCalls.n === 0, hostedCalls);
+
+// 4a) bring your own key (OpenAI, stubbed) overrides the built-in analyst
+await p.click('#chat [data-action="ai-setup"]');
+await p.selectOption('form[data-submit="ai-cfg"] select[name="provider"]', 'openai');
+await p.fill('form[data-submit="ai-cfg"] input[name="key"]', 'test-key-123');
+await p.click('form[data-submit="ai-cfg"] button.primary');
+await p.waitForTimeout(300);
+await p.fill('#chat-text', 'How many confirmed with my key?');
+await p.press('#chat-text', 'Enter');
+await p.waitForFunction(() => document.querySelectorAll('.msg.ai .body b').length >= 3);
+check('own key (OpenAI) answers instead of the built-in one', openaiCalls.n >= 3 && /your key/.test(await p.locator('#ai-status').innerText()), openaiCalls);
 
 // 4b) UX: briefing leads the overview, undo reverses the last edit, guide can be dismissed
 await p.evaluate(() => { location.hash = 'overview'; }); await p.waitForTimeout(300);
@@ -140,7 +183,8 @@ await p.waitForSelector('.kpis', { timeout: 15000 }).catch(async () => { console
 await p.waitForFunction(() => window.GCApp && window.GCApp.ws && window.GCApp.ws.tasks.length === 1, null, { timeout: 12000 }).catch(() => {});
 const persisted = await p.evaluate(() => ({ tasks: window.GCApp.ws.tasks.length, edits: window.GCApp.ws.edit_count }));
 check('edits persist after reload', persisted.tasks === 1 && persisted.edits === 2, persisted);
-check('key remembered after reload (analyst still available)', await p.locator('#chat-text').count() === 1);
+await p.waitForTimeout(500);
+check('own key remembered after reload', /your key/.test(await p.locator('#ai-status').innerText()));
 
 // 6) as-of time travel: before 1 March the edit made on 20 Apr does not apply
 await p.fill('#asof', '2025-03-01');

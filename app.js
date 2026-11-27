@@ -579,7 +579,7 @@
       case 'alerts-all': App.f.alertsAll = !App.f.alertsAll; render(); break;
       case 'camp-cols': App.f.campCols = !App.f.campCols; render(); break;
       case 'ai-setup': drawer(window.GCAI.setupHtml()); break;
-      case 'ai-remove': window.GCAI.removeCfg(); closeDrawer(); App.chatOpen = false; render(); toast('Key removed from this browser'); break;
+      case 'ai-remove': window.GCAI.removeCfg(); closeDrawer(); App.chatOpen = aiOn(); render(); toast(aiOn() ? 'Your key was removed. Using the built-in analyst.' : 'Key removed from this browser'); break;
       case 'ask': { if (!aiOn()) { drawer(window.GCAI.setupHtml()); break; } App.chatOpen = true; prefs('chat', true); render(); const i = document.getElementById('chat-text'); if (i) { i.value = el.dataset.q; const f = document.getElementById('chat-form'); if (f && f.requestSubmit) f.requestSubmit(); else i.focus(); } break; }
       case 'reset-do': { const r = await S.reset(App.wsId); toast(r.ok ? 'Workspace reset to the original data' : r.error); break; }
       case 'export': { const box = document.getElementById('export-box'); box.hidden = false; box.value = S.exportEdits(App.wsId); box.select(); try { await navigator.clipboard.writeText(box.value); toast('Change log copied'); } catch (e) { toast('Select the text to copy it'); } break; }
@@ -664,6 +664,7 @@
     App.recompute();
     window.GCAI && window.GCAI.mount(document.getElementById('chat'), App);
     const ch = prefs('chat'); App.chatOpen = aiOn() && (ch == null ? window.innerWidth > 1100 : ch);
+    App.onAiChange = () => { const c = prefs('chat'); App.chatOpen = aiOn() && (c == null ? window.innerWidth > 1100 : c); render(); };
     S.on(() => { App.recompute(); render(); window.GCAI && window.GCAI.refresh && window.GCAI.refresh(); });
     render();
   }
