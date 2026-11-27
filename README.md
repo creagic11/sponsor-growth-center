@@ -231,13 +231,13 @@ The model then calls tools that run the same engine functions the screens use:
 - Nothing is written before Confirm. Confirmed items are saved with `source: "ai"`.
 - A hidden `[Confirmed: …]` note goes into the history, so follow-ups ("did it save?", "now assign it to Ishita") know what happened.
 
-**Built-in analyst (no setup).** `api/chat.js` is a Vercel serverless function that forwards the analyst's requests to Google Gemini (`gemini-2.5-flash` by default) with the site owner's key, stored as the `GEMINI_API_KEY` environment variable. The key never reaches the browser. The function only forwards the conversation and tool declarations; the tools themselves run in the visitor's browser on the live data. It accepts calls only from the site's own pages, has a per-visitor rate limit (60 model calls per 10 minutes, about 15 questions), and fixes the model on the server.
+**Built-in analyst (no setup).** `api/chat.js` is a Vercel serverless function that forwards the analyst's requests to Google Gemini (`gemini-3.8-flash` by default; if Google retires that id, the function asks the API for the newest available Flash model and switches to it) with the site owner's key, stored as the `GEMINI_API_KEY` environment variable. The key never reaches the browser. The function only forwards the conversation and tool declarations; the tools themselves run in the visitor's browser on the live data. It accepts calls only from the site's own pages, has a per-visitor rate limit (60 model calls per 10 minutes, about 15 questions), and fixes the model on the server.
 
 **Bring your own key (optional).** Click **Key** in the analyst panel (or **Add AI analyst** on a host without the built-in key), pick a provider, paste a key and optionally a model:
 
 | Provider | Default model | API called from the browser |
 |---|---|---|
-| Google Gemini | `gemini-2.5-flash` (free key from Google AI Studio) | `generativelanguage.googleapis.com` (function calling) |
+| Google Gemini | `gemini-3.8-flash` (free key from Google AI Studio) | `generativelanguage.googleapis.com` (function calling) |
 | Anthropic Claude | `claude-sonnet-5-5` | `api.anthropic.com/v1/messages` (tool use) |
 | OpenAI | `gpt-4.1-mini` | `api.openai.com/v1/chat/completions` (tool calls) |
 

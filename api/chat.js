@@ -4,9 +4,26 @@
 // so this function never sees or stores the dashboard data beyond the request it forwards.
 // GET  /api/chat -> { available, model }      POST /api/chat -> Gemini generateContent response
 
-// Accept "gemini-2.5-flash" or "models/gemini-2.5-flash"; anything else (blank, spaces, a pasted key) falls back to the default.
-function cleanModel(v) { const m = String(v || '').trim().replace(/^models\//, ''); return /^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(m) ? m : 'gemini-2.5-flash'; }
-const MODEL = cleanModel(process.env.GEMINI_MODEL);
+// Accept "gemini-3.8-flash" or "models/gemini-3.8-flash"; anything else (blank, spaces, a pasted key) falls back to the default.
+function cleanModel(v) { const m = String(v || '').trim().replace(/^models\//, ''); return /^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(m) ? m : ''; }
+const DEFAULT_MODEL = 'gemini-3.8-flash';
+let MODEL = cleanModel(process.env.GEMINI_MODEL) || DEFAULT_MODEL;
+let discovered = false;
+
+// Google retires model ids over time. If the configured one is gone, ask the API which models this key can use
+// and switch to the newest stable "flash" model that supports generateContent (once per server instance).
+async function discoverModel(key) {
+  try {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ids = (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent')).map((m) => String(m.name || '').replace(/^models\//, ''));
+    const ver = (id) => { const m = id.match(/^gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+    const pick = (re) => ids.filter((id) => re.test(id)).sort((a, b) => ver(b) - ver(a))[0];
+    return pick(/^gemini-[\d.]+-flash$/) || pick(/^gemini-[\d.]+-flash(-latest)?$/) || pick(/^gemini-[\d.]+-flash/) || pick(/^gemini-/) || null;
+  } catch (e) { return null; }
+}
+const modelGone = (status, text) => (status === 404 || status === 400) && /no longer available|not found|is not supported|unexpected model name/i.test(text);
 const WINDOW_MS = 10 * 60 * 1000; // per-visitor limit, best effort (memory is per server instance)
 const MAX_PER_WINDOW = 60;        // one question usually takes 2-5 calls (tool rounds)
 const MAX_BODY_CHARS = 1_000_000;
@@ -43,11 +60,16 @@ module.exports = async function handler(req, res) {
   const json = JSON.stringify(payload);
   if (json.length > MAX_BODY_CHARS) return res.status(413).json({ error: { message: 'The conversation is too long. Start a new chat.' } });
 
+  const call = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: json,
+  });
   try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: json,
-    });
-    const text = await r.text();
+    let r = await call(MODEL); let text = await r.text();
+    if (modelGone(r.status, text) && !discovered) {
+      discovered = true;
+      const next = await discoverModel(key);
+      if (next && next !== MODEL) { MODEL = next; r = await call(MODEL); text = await r.text(); }
+    }
     res.status(r.status).setHeader('content-type', 'application/json');
     return res.send(text);
   } catch (e) {

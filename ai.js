@@ -26,7 +26,7 @@
   const getCfg = () => { try { const c = JSON.parse(localStorage.getItem(cfgKey) || 'null') || {}; if (c.model && !/^[a-z0-9][a-z0-9.\-]{2,80}$/i.test(String(c.model).trim().replace(/^models\//, ''))) c.model = ''; else if (c.model) c.model = String(c.model).trim().replace(/^models\//, ''); return c; } catch (e) { return {}; } };
   const setCfg = (c) => { try { localStorage.setItem(cfgKey, JSON.stringify(c)); } catch (e) {} };
   const PROVIDERS = {
-    gemini: { label: 'Google Gemini', model: 'gemini-2.5-flash', keyHelp: 'Free key from Google AI Studio (aistudio.google.com/apikey).' },
+    gemini: { label: 'Google Gemini', model: 'gemini-3.8-flash', keyHelp: 'Free key from Google AI Studio (aistudio.google.com/apikey).' },
     anthropic: { label: 'Anthropic Claude', model: 'claude-sonnet-5-5', keyHelp: 'Key from console.anthropic.com.' },
     openai: { label: 'OpenAI', model: 'gpt-4.1-mini', keyHelp: 'Key from platform.openai.com/api-keys.' },
   };
