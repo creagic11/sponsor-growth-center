@@ -47,7 +47,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   const key = String(process.env.GEMINI_API_KEY || '').trim();
-  if (req.method === 'GET') return res.status(200).json({ available: !!key, model: MODEL });
+  if (req.method === 'GET') {
+    // /api/chat?check=1 makes one tiny real call so the owner can see whether Gemini answers from this deployment.
+    if (!/[?&]check=1\b/.test(String(req.url || ''))) return res.status(200).json({ available: !!key, model: MODEL });
+    if (!key) return res.status(200).json({ available: false, ok: false, error: 'GEMINI_API_KEY is not set on this deployment.' });
+    const ip0 = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
+    if (limited(ip0)) return res.status(429).json({ ok: false, error: 'Too many checks; wait a few minutes.' });
+    const t0 = Date.now();
+    const o = await generate(key, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] }, 25000);
+    return res.status(200).json({ available: true, ok: o.ok, model: o.model || MODEL, ms: Date.now() - t0, error: o.ok ? undefined : o.error });
+  }
   if (req.method !== 'POST') { res.setHeader('Allow', 'GET, POST'); return res.status(405).json({ error: { message: 'Method not allowed' } }); }
   if (!key) return res.status(503).json({ error: { message: 'The built-in analyst is not configured on this deployment.' } });
 
@@ -67,29 +76,54 @@ module.exports = async function handler(req, res) {
   const json = JSON.stringify(payload);
   if (json.length > MAX_BODY_CHARS) return res.status(413).json({ error: { message: 'The conversation is too long. Start a new chat.' } });
 
-  // Thought signatures are tied to the model that produced them; a fallback model gets Google's documented
-  // placeholder value instead so a tool-calling turn can continue on another model.
-  const jsonFor = (model) => (model === MODEL ? json : json.replace(/"thoughtSignature":"[^"]*"/g, '"thoughtSignature":"skip_thought_signature_validator"'));
-  const call = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: jsonFor(model),
-  });
-  const started = Date.now(); const BUDGET_MS = 45000;
-  try {
-    let r = await call(MODEL); let text = await r.text();
-    if (busy(r.status, text)) { await sleep(800); r = await call(MODEL); text = await r.text(); }
-    if (modelGone(r.status, text) || busy(r.status, text)) {
-      const gone = modelGone(r.status, text);
-      for (const m of (await availableModels(key)).filter((x) => x !== MODEL)) {
-        if (Date.now() - started > BUDGET_MS) break;
-        const r2 = await call(m); const t2 = await r2.text();
-        if (r2.status >= 200 && r2.status < 300) { if (gone) MODEL = m; res.setHeader('x-model-used', m); r = r2; text = t2; break; }
-        if (!busy(r2.status, t2) && !modelGone(r2.status, t2)) { r = r2; text = t2; break; }
-      }
-    }
-    if (busy(r.status, text)) return res.status(503).json({ error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.' } });
-    res.status(r.status).setHeader('content-type', 'application/json');
-    return res.send(text);
-  } catch (e) {
-    return res.status(502).json({ error: { message: 'Could not reach the AI provider. Try again in a moment.' } });
-  }
+  const out = await generate(key, payload);
+  if (out.model && out.model !== MODEL) res.setHeader('x-model-used', out.model);
+  if (out.ok) { res.status(200).setHeader('content-type', 'application/json'); return res.send(out.text); }
+  return res.status(out.status).json({ error: out.error });
 };
+
+// Low thinking keeps each step fast (a question can take several tool rounds). If a model rejects the
+// setting, it is dropped for the life of this instance.
+let thinkingOk = true;
+const withThinking = (model, payload) => (thinkingOk && /^gemini-3/.test(model) ? Object.assign({}, payload, { generationConfig: { thinkingConfig: { thinkingLevel: 'low' } } }) : payload);
+
+// Calls Gemini with a hard time budget so the function always answers with JSON before the platform limit
+// (vercel.json allows 60 s). Order: configured model, one quick retry, then other Flash models.
+async function generate(key, payload, budgetMs = 50000) {
+  const started = Date.now(); const left = () => budgetMs - (Date.now() - started);
+  const json = JSON.stringify(payload);
+  // Thought signatures belong to the model that produced them; a fallback model gets Google's documented placeholder.
+  const bodyFor = (model) => { let b = model === MODEL ? json : json.replace(/"thoughtSignature":"[^"]*"/g, '"thoughtSignature":"skip_thought_signature_validator"'); return thinkingOk && /^gemini-3/.test(model) ? JSON.stringify(withThinking(model, JSON.parse(b))) : b; };
+  const call = async (model) => {
+    const ms = Math.min(30000, left());
+    if (ms < 3000) return { status: 504, text: '{"error":{"message":"time budget used up"}}' };
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: bodyFor(model), signal: AbortSignal.timeout(ms),
+      });
+      let text = await r.text();
+      if (r.status === 400 && thinkingOk && /thinking/i.test(text)) { thinkingOk = false; return call(model); }
+      return { status: r.status, text };
+    } catch (e) {
+      return { status: e && (e.name === 'TimeoutError' || e.name === 'AbortError') ? 504 : 502, text: JSON.stringify({ error: { message: e && e.name === 'TimeoutError' ? 'The model took too long to answer.' : 'Could not reach the AI provider.' } }) };
+    }
+  };
+  let model = MODEL; let r = await call(model);
+  if (busy(r.status, r.text) && left() > 8000) { await sleep(800); r = await call(model); }
+  if (modelGone(r.status, r.text) || busy(r.status, r.text)) {
+    const gone = modelGone(r.status, r.text);
+    for (const m of (await availableModels(key)).filter((x) => x !== MODEL)) {
+      if (left() < 5000) break;
+      const r2 = await call(m);
+      if (r2.status >= 200 && r2.status < 300) { if (gone) MODEL = m; model = m; r = r2; break; }
+      if (!busy(r2.status, r2.text) && !modelGone(r2.status, r2.text)) { model = m; r = r2; break; }
+    }
+  }
+  if (r.status >= 200 && r.status < 300) {
+    try { JSON.parse(r.text); return { ok: true, text: r.text, model }; } catch (e) { return { ok: false, status: 502, error: { code: 'bad_reply', message: 'The AI service sent an unreadable reply. Please try again.' }, model }; }
+  }
+  let detail = ''; try { detail = (JSON.parse(r.text).error || {}).message || ''; } catch (e) { detail = String(r.text || '').slice(0, 200); }
+  if (busy(r.status, r.text)) return { ok: false, status: 503, error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.', detail: `${r.status} ${detail}`.trim() }, model };
+  return { ok: false, status: r.status >= 400 && r.status < 600 ? r.status : 502, error: { code: 'upstream_error', message: detail || `The AI service answered with status ${r.status}.`, detail: `${r.status}` }, model };
+}
+module.exports.generate = generate;

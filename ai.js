@@ -213,10 +213,16 @@ Settings: ${JSON.stringify(ws.settings)}`;
       const send = () => apiFetch(target.url, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, target.headers),
         body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents, tools: [{ functionDeclarations: decl }] }) });
       let res = await send();
-      // one quiet retry when the provider is momentarily overloaded
-      if (res.status === 503 || res.status === 500) { setState('The AI service is busy, trying again…'); await new Promise((r) => setTimeout(r, 2500)); res = await send(); }
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw { code: res.status === 429 && !/high demand/i.test((j.error && j.error.message) || '') ? 'rate_limited' : (res.status === 503 || /high demand|overloaded/i.test((j.error && j.error.message) || '')) ? 'busy' : 'upstream_error', message: (j.error && j.error.message) || res.statusText };
+      // one quiet retry when the service is momentarily overloaded or slow
+      if ([500, 502, 503, 504].includes(res.status)) { setState('The AI service is busy, trying again…'); await new Promise((r) => setTimeout(r, 2500)); res = await send(); }
+      const raw = await res.text().catch(() => '');
+      let j = {}; try { j = raw ? JSON.parse(raw) : {}; } catch (e) { j = {}; }
+      if (!res.ok) {
+        const m = (j.error && j.error.message) || '';
+        const isBusy = (j.error && j.error.code === 'busy') || [500, 502, 503, 504].includes(res.status) || /high demand|overloaded|took too long/i.test(m);
+        const code = res.status === 429 && !/high demand/i.test(m) ? 'rate_limited' : isBusy ? 'busy' : 'upstream_error';
+        throw { code, message: m || ('status ' + res.status), status: res.status, partial: round > 0 };
+      }
       const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
       const t = parts.filter((p) => p.text).map((p) => p.text).join('');
       if (t) { text += (text ? '\n\n' : '') + t; onText(text); }
@@ -369,9 +375,9 @@ Settings: ${JSON.stringify(ws.settings)}`;
       const code = e && e.code;
       const own = ownKey();
       const msg = { cancelled: 'Stopped.', network: e.message, no_provider: 'Add an API key to use the analyst.',
-        busy: 'The AI service is very busy right now, so I could not answer. This is temporary: press Try again in a minute. Everything else on the dashboard keeps working.',
+        busy: (e && e.partial ? 'I pulled the data (see Data used) but the AI service was too busy to finish the answer. ' : 'The AI service is very busy right now, so I could not answer. ') + 'This is temporary: press Try again in a minute. Everything else on the dashboard keeps working.',
         rate_limited: own ? (e.message || 'Too many requests.') + ' (Your provider\'s rate limit.)' : 'Too many questions in a short time. Wait a minute and press Try again.' }[code]
-        || (own ? 'The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.' : 'The AI service returned an error: ' + ((e && e.message) || code || 'unknown') + '. Please press Try again.');
+        || (own ? 'The AI provider returned an error: ' + ((e && e.message) || code || 'unknown') + '. Check the key and model under Key.' : 'The AI service could not finish this answer' + (e && e.message ? ' (' + e.message + ')' : '') + '. Please press Try again; the rest of the dashboard keeps working.');
       failedQ = (code === 'cancelled') ? null : q;
       finalText = (e && e.text ? e.text + '\n\n' : '') + '_' + msg + '_';
     }

@@ -54,4 +54,19 @@ ok('fallback model gets the placeholder thought signature', fb && fb.body.includ
 globalThis.fetch = async (url) => url.includes('/models?') ? { ok: true, status: 200, json: async () => ({ models: [] }) } : { ok: false, status: 503, text: async () => '{"error":{"message":"high demand"}}' };
 r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '5.5.5.5' } }), r);
 ok('all models busy → friendly 503', r.code === 503 && /very busy/.test(r.body.error.message), r.body);
+// time budget: a hanging model becomes a JSON "busy" answer instead of a platform timeout
+const { generate } = h;
+globalThis.fetch = async (url, init) => url.includes('/models?') ? { ok: true, status: 200, json: async () => ({ models: [] }) }
+  : new Promise((resolve, reject) => { init.signal.addEventListener('abort', () => { const e = new Error('t'); e.name = 'TimeoutError'; reject(e); }); });
+const keep = setInterval(() => {}, 1000); // AbortSignal.timeout timers do not keep Node alive on their own
+let t0 = Date.now(); let g = await generate('k', { contents: [] }, 4000); clearInterval(keep);
+ok('hanging model → busy JSON within the budget', !g.ok && g.status === 503 && g.error.code === 'busy' && Date.now() - t0 < 6000, { g, ms: Date.now() - t0 });
+globalThis.fetch = async () => ({ status: 200, text: async () => '<html>oops' });
+g = await generate('k', { contents: [] }); ok('unreadable reply → JSON error', !g.ok && g.error.code === 'bad_reply', g);
+let lastBody = null; globalThis.fetch = async (url, init) => { lastBody = init && init.body; return { status: 200, text: async () => '{"candidates":[]}' }; };
+g = await generate('k', { contents: [] }); ok('gemini-3 calls ask for low thinking', g.ok && /"thinkingLevel":"low"/.test(lastBody), lastBody);
+globalThis.fetch = async (url, init) => { lastBody = init.body; return /thinkingLevel/.test(init.body) ? { status: 400, text: async () => '{"error":{"message":"Unknown name thinkingLevel"}}' } : { status: 200, text: async () => '{"candidates":[]}' }; };
+g = await generate('k', { contents: [] }); ok('model that rejects the thinking setting still answers', g.ok && !/thinkingLevel/.test(lastBody), lastBody);
+r = res(); await h(req({ method: 'GET', url: '/api/chat?check=1', headers: { host: 'site.test', 'x-forwarded-for': '4.4.4.4' } }), r);
+ok('GET ?check=1 reports a live check', r.code === 200 && r.body.ok === true && typeof r.body.ms === 'number', r.body);
 console.log(`${pass}/${pass + fail} passed`); process.exit(fail ? 1 : 0);
