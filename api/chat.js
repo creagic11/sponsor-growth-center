@@ -54,8 +54,8 @@ module.exports = async function handler(req, res) {
     const ip0 = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
     if (limited(ip0)) return res.status(429).json({ ok: false, error: 'Too many checks; wait a few minutes.' });
     const t0 = Date.now();
-    const o = await generate(key, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] }, 25000);
-    return res.status(200).json({ available: true, ok: o.ok, model: o.model || MODEL, ms: Date.now() - t0, error: o.ok ? undefined : o.error });
+    const o = await generate(key, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] }, 40000);
+    return res.status(200).json({ available: true, ok: o.ok, model: o.model || MODEL, attempts: o.attempts, ms: Date.now() - t0, error: o.ok ? undefined : o.error });
   }
   if (req.method !== 'POST') { res.setHeader('Allow', 'GET, POST'); return res.status(405).json({ error: { message: 'Method not allowed' } }); }
   if (!key) return res.status(503).json({ error: { message: 'The built-in analyst is not configured on this deployment.' } });
@@ -89,27 +89,31 @@ const withThinking = (model, payload) => (thinkingOk && /^gemini-3/.test(model) 
 
 // Calls Gemini with a hard time budget so the function always answers with JSON before the platform limit
 // (vercel.json allows 60 s). Order: configured model, one quick retry, then other Flash models.
+// Each attempt is capped so a slow, overloaded model leaves time to try a lighter one.
+const PER_CALL_MS = 15000;
 async function generate(key, payload, budgetMs = 50000) {
   const started = Date.now(); const left = () => budgetMs - (Date.now() - started);
   const json = JSON.stringify(payload);
   // Thought signatures belong to the model that produced them; a fallback model gets Google's documented placeholder.
   const bodyFor = (model) => { let b = model === MODEL ? json : json.replace(/"thoughtSignature":"[^"]*"/g, '"thoughtSignature":"skip_thought_signature_validator"'); return thinkingOk && /^gemini-3/.test(model) ? JSON.stringify(withThinking(model, JSON.parse(b))) : b; };
-  const call = async (model) => {
-    const ms = Math.min(30000, left());
+  const attempts = [];
+  const call = async (model) => { const t = Date.now(); const o = await call1(model); attempts.push({ model, status: o.status, ms: Date.now() - t }); return o; };
+  const call1 = async (model) => {
+    const ms = Math.min(PER_CALL_MS, left());
     if (ms < 3000) return { status: 504, text: '{"error":{"message":"time budget used up"}}' };
     try {
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: bodyFor(model), signal: AbortSignal.timeout(ms),
       });
       let text = await r.text();
-      if (r.status === 400 && thinkingOk && /thinking/i.test(text)) { thinkingOk = false; return call(model); }
+      if (r.status === 400 && thinkingOk && /thinking/i.test(text)) { thinkingOk = false; return call1(model); }
       return { status: r.status, text };
     } catch (e) {
       return { status: e && (e.name === 'TimeoutError' || e.name === 'AbortError') ? 504 : 502, text: JSON.stringify({ error: { message: e && e.name === 'TimeoutError' ? 'The model took too long to answer.' : 'Could not reach the AI provider.' } }) };
     }
   };
   let model = MODEL; let r = await call(model);
-  if (busy(r.status, r.text) && left() > 8000) { await sleep(800); r = await call(model); }
+  if (busy(r.status, r.text) && r.status !== 504 && left() > 20000) { await sleep(800); r = await call(model); }
   if (modelGone(r.status, r.text) || busy(r.status, r.text)) {
     const gone = modelGone(r.status, r.text);
     for (const m of (await availableModels(key)).filter((x) => x !== MODEL)) {
@@ -120,10 +124,10 @@ async function generate(key, payload, budgetMs = 50000) {
     }
   }
   if (r.status >= 200 && r.status < 300) {
-    try { JSON.parse(r.text); return { ok: true, text: r.text, model }; } catch (e) { return { ok: false, status: 502, error: { code: 'bad_reply', message: 'The AI service sent an unreadable reply. Please try again.' }, model }; }
+    try { JSON.parse(r.text); return { ok: true, text: r.text, model, attempts }; } catch (e) { return { ok: false, status: 502, error: { code: 'bad_reply', message: 'The AI service sent an unreadable reply. Please try again.' }, model, attempts }; }
   }
   let detail = ''; try { detail = (JSON.parse(r.text).error || {}).message || ''; } catch (e) { detail = String(r.text || '').slice(0, 200); }
-  if (busy(r.status, r.text)) return { ok: false, status: 503, error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.', detail: `${r.status} ${detail}`.trim() }, model };
-  return { ok: false, status: r.status >= 400 && r.status < 600 ? r.status : 502, error: { code: 'upstream_error', message: detail || `The AI service answered with status ${r.status}.`, detail: `${r.status}` }, model };
+  if (busy(r.status, r.text)) return { ok: false, status: 503, error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.', detail: `${r.status} ${detail}`.trim() }, model, attempts };
+  return { ok: false, status: r.status >= 400 && r.status < 600 ? r.status : 502, error: { code: 'upstream_error', message: detail || `The AI service answered with status ${r.status}.`, detail: `${r.status}` }, model, attempts };
 }
 module.exports.generate = generate;
