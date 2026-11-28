@@ -36,7 +36,7 @@
   function providerName() {
     const c = getCfg();
     if (ownKey()) return `${PROVIDERS[c.provider].label} · ${c.model || PROVIDERS[c.provider].model} (your key)`;
-    if (hosted && hosted.available) return `Built-in · Gemini ${hosted.model || ''}`.trim();
+    if (hosted && hosted.available) { const bk = (hosted.backup || []).join(', '); return hosted.model ? `Built-in · Gemini ${hosted.model}${bk ? ' (backup: ' + bk + ')' : ''}` : `Built-in · ${bk}`; }
     return null;
   }
   const enabled = () => !!providerName();

@@ -44,21 +44,48 @@ const modelGone = (status, text) => (status === 404 || status === 400) && /no lo
 const busy = (status, text) => status === 503 || status === 500 || status === 502 || status === 504 || (status === 429) || /high demand|overloaded|UNAVAILABLE|RESOURCE_EXHAUSTED/i.test(status >= 400 ? text : '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const backup = require('./_backup.js');
+
+// Gemini first; if it is busy, slow or failing, the free backups (Cerebras, Groq) answer instead.
+// After a busy Gemini reply, questions go to the backups first for two minutes.
+let geminiBusyUntil = 0;
+async function answer(key, payload, budgetMs = 52000, opts = {}) {
+  const t0 = Date.now(); const left = () => budgetMs - (Date.now() - t0);
+  const hasBackup = backup.configured().length > 0;
+  const attempts = []; let g = null;
+  const tryGemini = async (ms) => { g = await generate(key, payload, ms); attempts.push(...(g.attempts || [])); if (!g.ok && g.error && g.error.code === 'busy') geminiBusyUntil = Date.now() + 120000; return g; };
+  if (key && !opts.backupOnly && !(hasBackup && Date.now() < geminiBusyUntil)) {
+    await tryGemini(hasBackup ? 18000 : budgetMs);
+    if (g.ok || !hasBackup) return Object.assign({}, g, { attempts });
+  }
+  if (hasBackup) {
+    const b = await backup.generateBackup(payload, left());
+    attempts.push(...b.attempts);
+    if (b.ok) return Object.assign({}, b, { attempts });
+    if (key && !g && !opts.backupOnly && left() > 8000) { await tryGemini(left()); if (g.ok) return Object.assign({}, g, { attempts }); }
+    return { ok: false, status: 503, attempts, error: { code: 'busy', message: 'The AI service is very busy right now. Please try again in a minute.', detail: [g && g.error && g.error.detail, b.last && `${b.last.status} ${b.last.message}`].filter(Boolean).join(' | ') } };
+  }
+  return g ? Object.assign({}, g, { attempts }) : { ok: false, status: 503, attempts, error: { code: 'not_configured', message: 'The built-in analyst is not configured on this deployment.' } };
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   const key = String(process.env.GEMINI_API_KEY || '').trim();
   if (req.method === 'GET') {
     // /api/chat?check=1 makes one tiny real call so the owner can see whether Gemini answers from this deployment.
-    if (!/[?&]check=1\b/.test(String(req.url || ''))) return res.status(200).json({ available: !!key, model: MODEL });
-    if (!key) return res.status(200).json({ available: false, ok: false, error: 'GEMINI_API_KEY is not set on this deployment.' });
+    const backups = backup.configured().map((b) => b.name);
+    const check = (String(req.url || '').match(/[?&]check=(\w+)/) || [])[1];
+    if (!check) return res.status(200).json({ available: !!key || backups.length > 0, model: key ? MODEL : '', backup: backups });
+    if (!key && !backups.length) return res.status(200).json({ available: false, ok: false, error: 'Neither GEMINI_API_KEY nor a backup key is set on this deployment.' });
     const ip0 = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
     if (limited(ip0)) return res.status(429).json({ ok: false, error: 'Too many checks; wait a few minutes.' });
     const t0 = Date.now();
-    const o = await generate(key, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] }, 40000);
-    return res.status(200).json({ available: true, ok: o.ok, model: o.model || MODEL, attempts: o.attempts, ms: Date.now() - t0, error: o.ok ? undefined : o.error });
+    // ?check=1 tests the normal path; ?check=backup tests only the backup providers.
+    const o = await answer(key, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] }, 45000, { backupOnly: check === 'backup' });
+    return res.status(200).json({ available: true, ok: o.ok, answered_by: o.ok ? o.model : undefined, backup: backups, attempts: o.attempts, ms: Date.now() - t0, error: o.ok ? undefined : o.error });
   }
   if (req.method !== 'POST') { res.setHeader('Allow', 'GET, POST'); return res.status(405).json({ error: { message: 'Method not allowed' } }); }
-  if (!key) return res.status(503).json({ error: { message: 'The built-in analyst is not configured on this deployment.' } });
+  if (!key && !backup.configured().length) return res.status(503).json({ error: { message: 'The built-in analyst is not configured on this deployment.' } });
 
   // Only this site's own pages may use the owner's quota.
   const origin = req.headers.origin;
@@ -76,7 +103,7 @@ module.exports = async function handler(req, res) {
   const json = JSON.stringify(payload);
   if (json.length > MAX_BODY_CHARS) return res.status(413).json({ error: { message: 'The conversation is too long. Start a new chat.' } });
 
-  const out = await generate(key, payload);
+  const out = await answer(key, payload);
   if (out.model && out.model !== MODEL) res.setHeader('x-model-used', out.model);
   if (out.ok) { res.status(200).setHeader('content-type', 'application/json'); return res.send(out.text); }
   return res.status(out.status).json({ error: out.error });
@@ -95,7 +122,12 @@ async function generate(key, payload, budgetMs = 50000) {
   const started = Date.now(); const left = () => budgetMs - (Date.now() - started);
   const json = JSON.stringify(payload);
   // Thought signatures belong to the model that produced them; a fallback model gets Google's documented placeholder.
-  const bodyFor = (model) => { let b = model === MODEL ? json : json.replace(/"thoughtSignature":"[^"]*"/g, '"thoughtSignature":"skip_thought_signature_validator"'); return thinkingOk && /^gemini-3/.test(model) ? JSON.stringify(withThinking(model, JSON.parse(b))) : b; };
+  // Function calls written by a backup provider carry no signature, so they get the placeholder too.
+  const bodyFor = (model) => {
+    const p = JSON.parse(model === MODEL ? json : json.replace(/"thoughtSignature":"[^"]*"/g, '"thoughtSignature":"skip_thought_signature_validator"'));
+    for (const c of p.contents || []) if (c.role === 'model') for (const x of c.parts || []) if (x.functionCall && !x.thoughtSignature) x.thoughtSignature = 'skip_thought_signature_validator';
+    return JSON.stringify(thinkingOk && /^gemini-3/.test(model) ? withThinking(model, p) : p);
+  };
   const attempts = [];
   const call = async (model) => { const t = Date.now(); const o = await call1(model); attempts.push({ model, status: o.status, ms: Date.now() - t }); return o; };
   const call1 = async (model) => {

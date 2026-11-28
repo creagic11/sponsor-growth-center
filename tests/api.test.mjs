@@ -69,4 +69,31 @@ globalThis.fetch = async (url, init) => { lastBody = init.body; return /thinking
 g = await generate('k', { contents: [] }); ok('model that rejects the thinking setting still answers', g.ok && !/thinkingLevel/.test(lastBody), lastBody);
 r = res(); await h(req({ method: 'GET', url: '/api/chat?check=1', headers: { host: 'site.test', 'x-forwarded-for': '4.4.4.4' } }), r);
 ok('GET ?check=1 reports a live check', r.code === 200 && r.body.ok === true && typeof r.body.ms === 'number', r.body);
+// free backup providers: Gemini busy -> Cerebras answers, translated both ways
+process.env.GEMINI_MODEL = ''; process.env.CEREBRAS_API_KEY = 'cb-key';
+delete require.cache[require.resolve('../api/chat.js')]; delete require.cache[require.resolve('../api/_backup.js')]; h = require('../api/chat.js');
+const c3 = [];
+globalThis.fetch = async (url, init) => {
+  c3.push({ url, body: init && init.body, auth: init && init.headers && init.headers.authorization });
+  if (url.includes('generativelanguage') && url.includes('/models?')) return { ok: true, status: 200, json: async () => ({ models: [] }) };
+  if (url.includes('generativelanguage')) return { status: 503, text: async () => '{"error":{"message":"This model is currently experiencing high demand."}}' };
+  if (url.endsWith('/v1/models')) return { ok: true, status: 200, json: async () => ({ data: [{ id: 'llama3.1-8b' }, { id: 'gpt-oss-120b' }] }) };
+  return { status: 200, text: async () => JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'x', type: 'function', function: { name: 'get_overview', arguments: '{"as_of":"2027-01-10"}' } }] } }] }) };
+};
+r = res(); await h(req({ method: 'GET', headers: { host: 'site.test' } }), r); ok('GET lists the backup', JSON.stringify(r.body.backup) === '["Cerebras"]', r.body);
+const convo = { systemInstruction: { parts: [{ text: 'rules' }] }, tools: [{ functionDeclarations: [{ name: 'get_overview', description: 'kpis' }] }],
+  contents: [{ role: 'user', parts: [{ text: 'how are we doing?' }] }, { role: 'model', parts: [{ functionCall: { name: 'get_plan_status', args: { section: 'bets' } }, thoughtSignature: 'sig' }] }, { role: 'user', parts: [{ functionResponse: { name: 'get_plan_status', response: { result: { bets: [1] } } } }] }] };
+r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '3.3.3.3' }, body: convo }), r);
+const cb = c3.find((x) => x.url.includes('cerebras.ai/v1/chat'));
+const ob = cb && JSON.parse(cb.body);
+ok('busy Gemini → Cerebras answers in Gemini format', r.code === 200 && JSON.parse(r.body).candidates[0].content.parts[0].functionCall.args.as_of === '2027-01-10', r.body);
+ok('request translated: system, tool call ids paired, tools, preferred model', ob && ob.model === 'gpt-oss-120b' && ob.messages[0].role === 'system' && ob.messages[2].tool_calls[0].id === ob.messages[3].tool_call_id && ob.messages[3].content === '{"bets":[1]}' && ob.tools[0].function.parameters.type === 'object' && cb.auth === 'Bearer cb-key', ob);
+c3.length = 0; r = res(); await h(req({ headers: { host: 'site.test', 'x-forwarded-for': '3.3.3.4' }, body: convo }), r);
+ok('after a busy Gemini reply, the next question goes straight to the backup', r.code === 200 && !c3.some((x) => x.url.includes('generativelanguage')), c3.map((x) => x.url));
+r = res(); await h(req({ method: 'GET', url: '/api/chat?check=backup', headers: { host: 'site.test', 'x-forwarded-for': '3.3.3.5' } }), r);
+ok('?check=backup reports the backup answer', r.body.ok === true && /Cerebras/.test(r.body.answered_by), r.body);
+let gb = null; globalThis.fetch = async (url, init) => { gb = init.body; return { status: 200, text: async () => '{"candidates":[]}' }; };
+await h.generate('k', { contents: [{ role: 'model', parts: [{ functionCall: { name: 'a', args: {} } }] }] });
+ok('Gemini gets the signature placeholder on calls a backup wrote', /"thoughtSignature":"skip_thought_signature_validator"/.test(gb), gb);
+delete process.env.CEREBRAS_API_KEY;
 console.log(`${pass}/${pass + fail} passed`); process.exit(fail ? 1 : 0);
